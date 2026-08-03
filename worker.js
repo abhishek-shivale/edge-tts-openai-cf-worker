@@ -9,6 +9,8 @@ const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
 const WINDOWS_EPOCH_SECONDS = 11644473600n;
 const TICKS_PER_SECOND = 10000000n;
 const MAX_CHUNK_BYTES = 4096;
+const MAX_SYNTHESIS_CHUNKS = 8;
+const MAX_ESCAPED_INPUT_BYTES = MAX_CHUNK_BYTES * MAX_SYNTHESIS_CHUNKS;
 const WEB_SOCKET_TIMEOUT_MS = 30000;
 
 let clockSkewMs = 0;
@@ -120,6 +122,13 @@ function validateSpeechRequest(body) {
     if (input.length > 100000) {
         throw new ApiError("input exceeds 100000 characters", 400, "invalid_request_error");
     }
+    if (input.length > MAX_ESCAPED_INPUT_BYTES || escapedTextByteLength(input) > MAX_ESCAPED_INPUT_BYTES) {
+        throw new ApiError(
+            `input is too long for one request; split input into chunks of at most ${MAX_ESCAPED_INPUT_BYTES} escaped bytes`,
+            413,
+            "input_too_large"
+        );
+    }
     if (typeof requestedVoice !== "string") {
         throw new ApiError("voice must be a string", 400, "invalid_request_error");
     }
@@ -152,6 +161,13 @@ function validateSpeechRequest(body) {
 
 async function getVoice({ input, voice, rate, pitch, outputFormat }) {
     const chunks = splitText(input, MAX_CHUNK_BYTES);
+    if (chunks.length > MAX_SYNTHESIS_CHUNKS) {
+        throw new ApiError(
+            `input requires too many synthesis chunks; split input into smaller requests (maximum ${MAX_SYNTHESIS_CHUNKS})`,
+            413,
+            "input_too_large"
+        );
+    }
     const audioChunks = [];
 
     // Sequential connections avoid upstream throttling and Workers subrequest pressure.
@@ -330,7 +346,7 @@ function parseAudioMessage(buffer) {
 
     return {
         contentType: headers["content-type"] || null,
-        audio: bytes.slice(audioOffset)
+        audio: bytes.subarray(audioOffset)
     };
 }
 
@@ -410,29 +426,30 @@ function normalizeVoiceName(voice) {
 function splitText(text, maxBytes) {
     const cleanText = removeIncompatibleCharacters(text);
     const chunks = [];
-    let parts = [];
+    let chunk = "";
     let byteLength = 0;
     let lastBoundary = -1;
 
-    function flush(count = parts.length) {
-        const chunk = parts.slice(0, count).join("").trim();
-        if (chunk) chunks.push(chunk);
-        parts = parts.slice(count);
-        byteLength = parts.reduce((total, part) => total + encoder.encode(part).byteLength, 0);
+    function flush(preferBoundary = true) {
+        const boundary = preferBoundary && lastBoundary >= 0 ? lastBoundary : chunk.length;
+        const completeChunk = chunk.slice(0, boundary).trim();
+        if (completeChunk) chunks.push(completeChunk);
+        chunk = chunk.slice(boundary);
+        byteLength = utf8ByteLength(chunk);
         lastBoundary = -1;
     }
 
     for (const character of cleanText) {
-        const escaped = escapeXmlText(character);
-        const escapedBytes = encoder.encode(escaped).byteLength;
-        while (byteLength + escapedBytes > maxBytes && parts.length > 0) {
-            flush(lastBoundary >= 0 ? lastBoundary + 1 : parts.length);
+        const escaped = escapeXmlCharacter(character);
+        const escapedBytes = utf8ByteLength(escaped);
+        while (byteLength + escapedBytes > maxBytes && chunk.length > 0) {
+            flush();
         }
-        parts.push(escaped);
+        chunk += escaped;
         byteLength += escapedBytes;
-        if (/\s/u.test(character)) lastBoundary = parts.length - 1;
+        if (/\s/u.test(character)) lastBoundary = chunk.length;
     }
-    flush();
+    if (chunk) flush(false);
 
     if (chunks.length === 0) {
         throw new ApiError("input contains no synthesizable characters", 400, "invalid_request_error");
@@ -450,14 +467,36 @@ function closeWebSocket(webSocket, reason) {
 }
 
 function removeIncompatibleCharacters(text) {
-    return Array.from(text, character => {
-        const code = character.codePointAt(0);
-        return (code <= 8 || (code >= 11 && code <= 12) || (code >= 14 && code <= 31)) ? " " : character;
-    }).join("");
+    return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
+}
+
+function escapedTextByteLength(text) {
+    let total = 0;
+    for (const character of text) {
+        total += utf8ByteLength(escapeXmlCharacter(character));
+    }
+    return total;
+}
+
+function utf8ByteLength(value) {
+    let total = 0;
+    for (let index = 0; index < value.length;) {
+        const codePoint = value.codePointAt(index);
+        total += codePoint <= 0x7F ? 1 : codePoint <= 0x7FF ? 2 : codePoint <= 0xFFFF ? 3 : 4;
+        index += codePoint > 0xFFFF ? 2 : 1;
+    }
+    return total;
 }
 
 function escapeXmlText(value) {
     return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeXmlCharacter(character) {
+    if (character === "&") return "&amp;";
+    if (character === "<") return "&lt;";
+    if (character === ">") return "&gt;";
+    return character;
 }
 
 function escapeXmlAttribute(value) {

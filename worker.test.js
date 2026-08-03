@@ -36,6 +36,13 @@ test("validates and converts OpenAI-compatible parameters", () => {
     );
 });
 
+test("rejects input that would require too many upstream connections", () => {
+    assert.throws(
+        () => validateSpeechRequest({ input: "a".repeat(32769) }),
+        error => error.status === 413 && error.code === "input_too_large"
+    );
+});
+
 test("escapes text and emits Edge-compatible SSML", () => {
     const escaped = escapeXmlText("A & B < C > D");
     const ssml = getSsml(escaped, "en-US-JennyNeural", "+0%", "+0Hz");
@@ -53,6 +60,7 @@ test("splits escaped UTF-8 text without exceeding byte limit", () => {
         assert.ok(Buffer.byteLength(chunk) <= 4096);
         assert.doesNotMatch(chunk, /&(?!amp;|lt;|gt;)/);
     }
+    assert.deepEqual(splitText("a b c", 3), ["a", "b c"]);
 });
 
 test("parses Edge binary audio frames", () => {
