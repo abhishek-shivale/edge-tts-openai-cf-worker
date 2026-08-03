@@ -149,7 +149,16 @@ for voice in "${VOICES[@]}"; do
     else
         echo "❌ 失败 (HTTP $http_code)"
         echo "❌ 失败 (HTTP $http_code)" >> "$RESULT_LOG"
-        rm -f "$output_file"  # 删除失败的文件
+        mkdir -p "$OUTPUT_DIR/errors"
+        error_file="$OUTPUT_DIR/errors/$(basename "$output_file" .mp3).json"
+        if [ -f "$output_file" ]; then
+            mv "$output_file" "$error_file"
+            error_message=$(tr '\n' ' ' < "$error_file")
+        else
+            error_message="请求失败，未收到响应体"
+        fi
+        echo "错误响应: $error_message"
+        echo "错误响应: $error_message" >> "$RESULT_LOG"
     fi
     echo "----------------------------------------" | tee -a "$RESULT_LOG"
 done

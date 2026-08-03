@@ -1,350 +1,576 @@
 const encoder = new TextEncoder();
-let expiredAt = null;
-let endpoint = null;
-let clientId = "76a75279-2ffa-4c3d-8db8-7b47252aa41c";
+const decoder = new TextDecoder();
+
+const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+const EDGE_BASE_URL = "speech.platform.bing.com/consumer/speech/synthesize/readaloud";
+const CHROMIUM_FULL_VERSION = "143.0.3650.75";
+const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
+const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
+const WINDOWS_EPOCH_SECONDS = 11644473600n;
+const TICKS_PER_SECOND = 10000000n;
+const MAX_CHUNK_BYTES = 4096;
+const WEB_SOCKET_TIMEOUT_MS = 30000;
+
+let clockSkewMs = 0;
 
 const API_KEY = globalThis.API_KEY;
 
-// 添加缓存和预刷新机制
-const TOKEN_REFRESH_BEFORE_EXPIRY = 5 * 60; // 提前5分钟刷新token
-let tokenInfo = {
-    endpoint: null,
-    token: null,
-    expiredAt: null
-};
-
-// 在文件顶部常量定义区域添加映射表
 const VOICE_MAPPING = {
-    'alloy': 'zh-CN-XiaoxiaoNeural',
-    'echo': 'zh-CN-YunxiNeural', 
-    'fable': 'zh-CN-XiaoyiNeural',
-    'onyx': 'zh-CN-YunyangNeural',
-    'nova': 'zh-CN-XiaohanNeural',
-    'shimmer': 'zh-CN-XiaomengNeural'
+    alloy: "zh-CN-XiaoxiaoNeural",
+    echo: "zh-CN-YunxiNeural",
+    fable: "zh-CN-XiaoyiNeural",
+    onyx: "zh-CN-YunyangNeural",
+    nova: "zh-CN-XiaohanNeural",
+    shimmer: "zh-CN-XiaomengNeural"
 };
 
-addEventListener("fetch", event => {
-    event.respondWith(handleRequest(event.request));
-});
+class ApiError extends Error {
+    constructor(message, status = 500, code = "edge_tts_error", upstreamStatus = null) {
+        super(message);
+        this.name = "ApiError";
+        this.status = status;
+        this.code = code;
+        this.upstreamStatus = upstreamStatus;
+    }
+}
+
+if (typeof addEventListener === "function") {
+    addEventListener("fetch", event => {
+        event.respondWith(handleRequest(event.request));
+    });
+}
 
 async function handleRequest(request) {
     if (request.method === "OPTIONS") {
         return handleOptions(request);
     }
-    
-    // 只在设置了 API_KEY 的情况下才验证
-    if (API_KEY) {
-        const authHeader = request.headers.get("authorization");
-        const apiKey = authHeader?.startsWith("Bearer ") 
-            ? authHeader.slice(7) 
-            : null;
-                      
-        if (apiKey !== API_KEY) {
-            return new Response(JSON.stringify({
-                error: {
-                    message: "Invalid API key. Use 'Authorization: Bearer your-api-key' header",
-                    type: "invalid_request_error",
-                    param: null,
-                    code: "invalid_api_key"
-                }
-            }), {
-                status: 401,
-                headers: {
-                    "Content-Type": "application/json",
-                    ...makeCORSHeaders()
-                }
-            });
-        }
-    }
 
     const requestUrl = new URL(request.url);
-    const path = requestUrl.pathname;
-    
-    if (path === "/v1/audio/speech") {
-        try {
-            const requestBody = await request.json();
-            let { 
-                model = "tts-1",
-                input,
-                voice = "zh-CN-XiaoxiaoNeural",
-                response_format = "mp3",
-                speed = 1.0,
-                pitch = 1.0,
-                style = "general"
-            } = requestBody;
+    if (requestUrl.pathname !== "/v1/audio/speech") {
+        return new Response("Not Found", { status: 404, headers: makeCORSHeaders() });
+    }
 
-            // 添加语音名称映射
-            voice = VOICE_MAPPING[voice] || voice;  // 如果存在映射则替换，否则保持原值
+    if (request.method !== "POST") {
+        return errorResponse(new ApiError("Method must be POST", 405, "method_not_allowed"));
+    }
 
-            const rate = ((speed - 1) * 100).toFixed(0);
-            const numPitch = ((pitch - 1) * 100).toFixed(0); // 将 pitch 参数转换为百分比形式
-            const response = await getVoice(
-                input, 
-                voice, 
-                rate,
-                numPitch,
-                style,
-                "audio-24khz-48kbitrate-mono-mp3",
-                false
-            );
-
-            return response;
-
-        } catch (error) {
-            console.error("Error:", error);
-            return new Response(JSON.stringify({
-                error: {
-                    message: error.message,
-                    type: "api_error",
-                    param: null,
-                    code: "edge_tts_error"
-                }
-            }), {
-                status: 500,
-                headers: {
-                    "Content-Type": "application/json",
-                    ...makeCORSHeaders()
-                }
-            });
+    if (API_KEY) {
+        const authHeader = request.headers.get("authorization");
+        const apiKey = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+        if (apiKey !== API_KEY) {
+            return errorResponse(new ApiError(
+                "Invalid API key. Use 'Authorization: Bearer your-api-key' header",
+                401,
+                "invalid_api_key"
+            ));
         }
     }
 
-    // 默认返回 404
-    return new Response("Not Found", { status: 404 });
-}
-
-async function handleOptions(request) {
-    return new Response(null, {
-        status: 204,
-        headers: {
-            ...makeCORSHeaders(),
-            "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-            "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "Authorization"
-        }
-    });
-}
-
-async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = 0, pitch = 0, style = "general", outputFormat = "audio-24khz-48kbitrate-mono-mp3", download = false) {
     try {
-        const maxChunkSize = 2000; // 假设每次请求的最大文本长度为2000字符
-        const chunks = [];
-
-        // 将长文本分段
-        for (let i = 0; i < text.length; i += maxChunkSize) {
-            const chunk = text.slice(i, i + maxChunkSize);
-            chunks.push(chunk);
+        let requestBody;
+        try {
+            requestBody = await request.json();
+        } catch {
+            throw new ApiError("Request body must be valid JSON", 400, "invalid_request_error");
         }
 
-        // 获取每个分段的音频
-        const audioChunks = await Promise.all(chunks.map(chunk => getAudioChunk(chunk, voiceName, rate, pitch, style, outputFormat)));
-
-        // 将音频片段拼接起来
-        const concatenatedAudio = new Blob(audioChunks, { type: 'audio/mpeg' });
-        const response = new Response(concatenatedAudio, {
+        const options = validateSpeechRequest(requestBody);
+        const audio = await getVoice(options);
+        return new Response(audio, {
             headers: {
                 "Content-Type": "audio/mpeg",
+                "Cache-Control": "no-store",
                 ...makeCORSHeaders()
             }
         });
-
-        if (download) {
-            response.headers.set("Content-Disposition", `attachment; filename="${uuid()}.mp3"`);
-        }
-
-        return response;
-
     } catch (error) {
-        console.error("语音合成失败:", error);
-        return new Response(JSON.stringify({
-            error: {
-                message: error.message,
-                type: "api_error",
-                param: null,
-                code: "edge_tts_error"
-            }
-        }), {
-            status: 500,
-            headers: {
-                "Content-Type": "application/json",
-                ...makeCORSHeaders()
-            }
-        });
+        const normalizedError = normalizeError(error);
+        console.error(JSON.stringify({
+            event: "speech_synthesis_failed",
+            message: normalizedError.message,
+            status: normalizedError.status,
+            upstreamStatus: normalizedError.upstreamStatus,
+            stack: normalizedError.stack
+        }));
+        return errorResponse(normalizedError);
     }
 }
 
-
-//获取单个音频数据
-async function getAudioChunk(text, voiceName, rate, pitch, style, outputFormat) {
-    const endpoint = await getEndpoint();
-    const url = `https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/v1`;
-
-    const response = await fetch(url, {
-        method: "POST",
-        headers: {
-            "Authorization": endpoint.t,
-            "Content-Type": "application/ssml+xml",
-            "User-Agent": "okhttp/4.5.0",
-            "X-Microsoft-OutputFormat": outputFormat
-        },
-        body: getSsml(text, voiceName, rate, pitch, style)
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Edge TTS API error: ${response.status} ${errorText}`);
+function validateSpeechRequest(body) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+        throw new ApiError("Request body must be a JSON object", 400, "invalid_request_error");
     }
 
-    return response.blob();
-}
+    const {
+        model = "tts-1",
+        input,
+        voice: requestedVoice = "zh-CN-XiaoxiaoNeural",
+        response_format: responseFormat = "mp3",
+        speed = 1.0,
+        pitch = 1.0,
+        style = "general"
+    } = body;
 
-function getSsml(text, voiceName, rate, pitch,style) {
-    return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN"> 
-                <voice name="${voiceName}"> 
-                    <mstts:express-as style="${style}"  styledegree="1.0" role="default" > 
-                        <prosody rate="${rate}%" pitch="${pitch}%" volume="50">${text}</prosody> 
-                    </mstts:express-as> 
-                </voice> 
-            </speak>`;
-
-}
-
-// 优化 getEndpoint 函数
-async function getEndpoint() {
-    const now = Date.now() / 1000;
-    
-    // 检查token是否有效（提前5分钟刷新）
-    if (tokenInfo.token && tokenInfo.expiredAt && now < tokenInfo.expiredAt - TOKEN_REFRESH_BEFORE_EXPIRY) {
-        console.log(`使用缓存的token，剩余 ${((tokenInfo.expiredAt - now) / 60).toFixed(1)} 分钟`);
-        return tokenInfo.endpoint;
+    if (typeof model !== "string" || model.length === 0) {
+        throw new ApiError("model must be a non-empty string", 400, "invalid_request_error");
+    }
+    if (typeof input !== "string" || input.trim().length === 0) {
+        throw new ApiError("input must be a non-empty string", 400, "invalid_request_error");
+    }
+    if (input.length > 100000) {
+        throw new ApiError("input exceeds 100000 characters", 400, "invalid_request_error");
+    }
+    if (typeof requestedVoice !== "string") {
+        throw new ApiError("voice must be a string", 400, "invalid_request_error");
     }
 
-    // 获取新token
-    const endpointUrl = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0";
-    const clientId = crypto.randomUUID().replace(/-/g, "");
-    
-    try {
-        const response = await fetch(endpointUrl, {
-            method: "POST",
-            headers: {
-                "Accept-Language": "zh-Hans",
-                "X-ClientVersion": "4.0.530a 5fe1dc6c",
-                "X-UserId": "0f04d16a175c411e",
-                "X-HomeGeographicRegion": "zh-Hans-CN",
-                "X-ClientTraceId": clientId,
-                "X-MT-Signature": await sign(endpointUrl),
-                "User-Agent": "okhttp/4.5.0",
-                "Content-Type": "application/json; charset=utf-8",
-                "Content-Length": "0",
-                "Accept-Encoding": "gzip"
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error(`获取endpoint失败: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const jwt = data.t.split(".")[1];
-        const decodedJwt = JSON.parse(atob(jwt));
-        
-        // 更新缓存
-        tokenInfo = {
-            endpoint: data,
-            token: data.t,
-            expiredAt: decodedJwt.exp
-        };
-
-        console.log(`获取新token成功，有效期 ${((decodedJwt.exp - now) / 60).toFixed(1)} 分钟`);
-        return data;
-
-    } catch (error) {
-        console.error("获取endpoint失败:", error);
-        // 如果有缓存的token，即使过期也尝试使用
-        if (tokenInfo.token) {
-            console.log("使用过期的缓存token");
-            return tokenInfo.endpoint;
-        }
-        throw error;
+    const voice = VOICE_MAPPING[requestedVoice] || requestedVoice;
+    if (!/^[a-z]{2,}-[A-Z]{2,}-(?:[A-Za-z0-9]+-)*[A-Za-z0-9]+Neural$/.test(voice)) {
+        throw new ApiError(`Invalid voice: ${requestedVoice}`, 400, "invalid_request_error");
     }
-}
-
-function addCORSHeaders(response) {
-    const newHeaders = new Headers(response.headers);
-    for (const [key, value] of Object.entries(makeCORSHeaders())) {
-        newHeaders.set(key, value);
+    if (responseFormat !== "mp3") {
+        throw new ApiError("Only response_format 'mp3' is supported", 400, "invalid_request_error");
     }
-    return new Response(response.body, { ...response, headers: newHeaders });
-}
+    if (typeof speed !== "number" || !Number.isFinite(speed) || speed < 0.5 || speed > 2.0) {
+        throw new ApiError("speed must be a number between 0.5 and 2.0", 400, "invalid_request_error");
+    }
+    if (typeof pitch !== "number" || !Number.isFinite(pitch) || pitch < 0.5 || pitch > 2.0) {
+        throw new ApiError("pitch must be a number between 0.5 and 2.0", 400, "invalid_request_error");
+    }
+    if (typeof style !== "string") {
+        throw new ApiError("style must be a string", 400, "invalid_request_error");
+    }
 
-function makeCORSHeaders() {
     return {
-        "Access-Control-Allow-Origin": "*", // 可以将 "*" 替换为特定的来源，例如 "https://9a17e592.text2voice.pages.dev"
-        "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, x-api-key",
-        "Access-Control-Max-Age": "86400" // 允许OPTIONS请求预检缓存的时间
+        input,
+        voice,
+        rate: signedValue(Math.round((speed - 1) * 100), "%"),
+        pitch: signedValue(Math.round((pitch - 1) * 100), "Hz"),
+        outputFormat: "audio-24khz-48kbitrate-mono-mp3"
     };
 }
 
-async function hmacSha256(key, data) {
-    const cryptoKey = await crypto.subtle.importKey(
-        "raw",
-        key,
-        { name: "HMAC", hash: { name: "SHA-256" } },
-        false,
-        ["sign"]
-    );
-    const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
-    return new Uint8Array(signature);
-}
+async function getVoice({ input, voice, rate, pitch, outputFormat }) {
+    const chunks = splitText(input, MAX_CHUNK_BYTES);
+    const audioChunks = [];
 
-async function base64ToBytes(base64) {
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+    // Sequential connections avoid upstream throttling and Workers subrequest pressure.
+    for (const chunk of chunks) {
+        audioChunks.push(await getAudioChunk(chunk, voice, rate, pitch, outputFormat));
     }
-    return bytes;
+
+    return new Blob(audioChunks, { type: "audio/mpeg" });
 }
 
-async function bytesToBase64(bytes) {
-    return btoa(String.fromCharCode.apply(null, bytes));
+async function getAudioChunk(escapedText, voice, rate, pitch, outputFormat) {
+    try {
+        return await synthesizeChunk(escapedText, voice, rate, pitch, outputFormat);
+    } catch (error) {
+        if (error?.upstreamStatus !== 403 || !Number.isFinite(error.serverTimeMs)) {
+            throw error;
+        }
+
+        clockSkewMs = error.serverTimeMs - Date.now();
+        return synthesizeChunk(escapedText, voice, rate, pitch, outputFormat);
+    }
+}
+
+async function synthesizeChunk(escapedText, voice, rate, pitch, outputFormat) {
+    const connectionId = uuid();
+    const token = await generateSecMsGec();
+    const url = `https://${EDGE_BASE_URL}/edge/v1` +
+        `?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}` +
+        `&ConnectionId=${connectionId}` +
+        `&Sec-MS-GEC=${token}` +
+        `&Sec-MS-GEC-Version=${encodeURIComponent(SEC_MS_GEC_VERSION)}`;
+
+    const response = await fetchWithTimeout(url, {
+        headers: {
+            Upgrade: "websocket",
+            Pragma: "no-cache",
+            "Cache-Control": "no-cache",
+            Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+            "User-Agent": edgeUserAgent(),
+            Cookie: `muid=${uuid().toUpperCase()};`
+        }
+    }, WEB_SOCKET_TIMEOUT_MS);
+
+    if (!response.webSocket) {
+        const responseText = await safeResponseText(response);
+        const error = new ApiError(
+            `Edge TTS WebSocket handshake failed: ${response.status}${responseText ? ` ${responseText}` : ""}`,
+            502,
+            "edge_tts_upstream_error",
+            response.status
+        );
+        const serverTime = Date.parse(response.headers.get("Date") || "");
+        error.serverTimeMs = Number.isFinite(serverTime) ? serverTime : null;
+        throw error;
+    }
+
+    const webSocket = response.webSocket;
+    webSocket.binaryType = "arraybuffer";
+    webSocket.accept();
+
+    return receiveAudio(webSocket, escapedText, voice, rate, pitch, outputFormat);
+}
+
+function receiveAudio(webSocket, escapedText, voice, rate, pitch, outputFormat) {
+    return new Promise((resolve, reject) => {
+        const audioChunks = [];
+        let settled = false;
+
+        const timer = setTimeout(() => {
+            fail(new ApiError("Edge TTS WebSocket timed out", 504, "edge_tts_timeout"));
+        }, WEB_SOCKET_TIMEOUT_MS);
+
+        function cleanup() {
+            clearTimeout(timer);
+            webSocket.removeEventListener("message", onMessage);
+            webSocket.removeEventListener("error", onError);
+            webSocket.removeEventListener("close", onClose);
+        }
+
+        function finish() {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            closeWebSocket(webSocket, "done");
+            if (audioChunks.length === 0) {
+                reject(new ApiError(
+                    "Edge TTS returned no audio. Verify voice and parameters.",
+                    502,
+                    "edge_tts_no_audio"
+                ));
+                return;
+            }
+            resolve(new Blob(audioChunks, { type: "audio/mpeg" }));
+        }
+
+        function fail(error) {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            closeWebSocket(webSocket, "synthesis failed");
+            reject(normalizeError(error));
+        }
+
+        function onMessage(event) {
+            handleWebSocketMessage(event.data, audioChunks, finish).catch(fail);
+        }
+
+        function onError() {
+            fail(new ApiError("Edge TTS WebSocket error", 502, "edge_tts_upstream_error"));
+        }
+
+        function onClose(event) {
+            if (!settled) {
+                fail(new ApiError(
+                    `Edge TTS WebSocket closed before completion: ${event.code} ${event.reason || ""}`.trim(),
+                    502,
+                    "edge_tts_upstream_error"
+                ));
+            }
+        }
+
+        webSocket.addEventListener("message", onMessage);
+        webSocket.addEventListener("error", onError);
+        webSocket.addEventListener("close", onClose);
+
+        try {
+            webSocket.send(makeSpeechConfig(outputFormat));
+            webSocket.send(makeSsmlRequest(escapedText, voice, rate, pitch));
+        } catch (error) {
+            fail(error);
+        }
+    });
+}
+
+async function handleWebSocketMessage(data, audioChunks, finish) {
+    if (typeof data === "string") {
+        const { headers } = parseProtocolMessage(data);
+        const path = headers.path;
+        if (path === "turn.end") finish();
+        if (path && !["turn.start", "turn.end", "response", "audio.metadata"].includes(path)) {
+            throw new ApiError(`Unexpected Edge TTS message path: ${path}`, 502, "edge_tts_protocol_error");
+        }
+        return;
+    }
+
+    const buffer = data instanceof Blob ? await data.arrayBuffer() : data;
+    if (!(buffer instanceof ArrayBuffer)) {
+        throw new ApiError("Unexpected Edge TTS binary message type", 502, "edge_tts_protocol_error");
+    }
+
+    const parsed = parseAudioMessage(buffer);
+    if (parsed.contentType === "audio/mpeg" && parsed.audio.byteLength > 0) {
+        audioChunks.push(parsed.audio);
+    } else if (parsed.contentType !== null || parsed.audio.byteLength > 0) {
+        throw new ApiError("Invalid Edge TTS audio frame", 502, "edge_tts_protocol_error");
+    }
+}
+
+function parseAudioMessage(buffer) {
+    const bytes = new Uint8Array(buffer);
+    if (bytes.byteLength < 2) {
+        throw new ApiError("Edge TTS audio frame missing header length", 502, "edge_tts_protocol_error");
+    }
+
+    const headerLength = new DataView(buffer).getUint16(0, false);
+    const audioOffset = 2 + headerLength;
+    if (audioOffset > bytes.byteLength) {
+        throw new ApiError("Edge TTS audio frame has invalid header length", 502, "edge_tts_protocol_error");
+    }
+
+    const headerText = decoder.decode(bytes.slice(2, audioOffset));
+    const headers = parseHeaders(headerText);
+    if (headers.path !== "audio") {
+        throw new ApiError("Unexpected Edge TTS binary message path", 502, "edge_tts_protocol_error");
+    }
+
+    return {
+        contentType: headers["content-type"] || null,
+        audio: bytes.slice(audioOffset)
+    };
+}
+
+function parseProtocolMessage(message) {
+    const separator = message.indexOf("\r\n\r\n");
+    if (separator < 0) {
+        throw new ApiError("Malformed Edge TTS protocol message", 502, "edge_tts_protocol_error");
+    }
+    return {
+        headers: parseHeaders(message.slice(0, separator)),
+        body: message.slice(separator + 4)
+    };
+}
+
+function parseHeaders(headerText) {
+    const headers = {};
+    for (const line of headerText.split("\r\n")) {
+        const separator = line.indexOf(":");
+        if (separator > 0) {
+            headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+        }
+    }
+    return headers;
+}
+
+function makeSpeechConfig(outputFormat) {
+    const config = {
+        context: {
+            synthesis: {
+                audio: {
+                    metadataoptions: {
+                        sentenceBoundaryEnabled: "false",
+                        wordBoundaryEnabled: "false"
+                    },
+                    outputFormat
+                }
+            }
+        }
+    };
+    return `X-Timestamp:${edgeTimestamp()}\r\n` +
+        "Content-Type:application/json; charset=utf-8\r\n" +
+        "Path:speech.config\r\n\r\n" +
+        `${JSON.stringify(config)}\r\n`;
+}
+
+function makeSsmlRequest(escapedText, voice, rate, pitch) {
+    const timestamp = edgeTimestamp();
+    const ssml = getSsml(escapedText, voice, rate, pitch);
+    return `X-RequestId:${uuid()}\r\n` +
+        "Content-Type:application/ssml+xml\r\n" +
+        `X-Timestamp:${timestamp}Z\r\n` +
+        "Path:ssml\r\n\r\n" +
+        ssml;
+}
+
+function getSsml(escapedText, voice, rate, pitch) {
+    const edgeVoice = normalizeVoiceName(voice);
+    return "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
+        `<voice name='${escapeXmlAttribute(edgeVoice)}'>` +
+        `<prosody pitch='${pitch}' rate='${rate}' volume='+0%'>${escapedText}</prosody>` +
+        "</voice></speak>";
+}
+
+function normalizeVoiceName(voice) {
+    const match = /^([a-z]{2,})-([A-Z]{2,})-(.+Neural)$/.exec(voice);
+    if (!match) return voice;
+
+    let [, language, region, name] = match;
+    const separator = name.indexOf("-");
+    if (separator !== -1) {
+        region = `${region}-${name.slice(0, separator)}`;
+        name = name.slice(separator + 1);
+    }
+    return `Microsoft Server Speech Text to Speech Voice (${language}-${region}, ${name})`;
+}
+
+function splitText(text, maxBytes) {
+    const cleanText = removeIncompatibleCharacters(text);
+    const chunks = [];
+    let parts = [];
+    let byteLength = 0;
+    let lastBoundary = -1;
+
+    function flush(count = parts.length) {
+        const chunk = parts.slice(0, count).join("").trim();
+        if (chunk) chunks.push(chunk);
+        parts = parts.slice(count);
+        byteLength = parts.reduce((total, part) => total + encoder.encode(part).byteLength, 0);
+        lastBoundary = -1;
+    }
+
+    for (const character of cleanText) {
+        const escaped = escapeXmlText(character);
+        const escapedBytes = encoder.encode(escaped).byteLength;
+        while (byteLength + escapedBytes > maxBytes && parts.length > 0) {
+            flush(lastBoundary >= 0 ? lastBoundary + 1 : parts.length);
+        }
+        parts.push(escaped);
+        byteLength += escapedBytes;
+        if (/\s/u.test(character)) lastBoundary = parts.length - 1;
+    }
+    flush();
+
+    if (chunks.length === 0) {
+        throw new ApiError("input contains no synthesizable characters", 400, "invalid_request_error");
+    }
+    return chunks;
+}
+
+function closeWebSocket(webSocket, reason) {
+    if (webSocket.readyState !== 0 && webSocket.readyState !== 1) return;
+    try {
+        webSocket.close(1000, reason);
+    } catch {
+        // Connection is already closing or runtime rejected a redundant close.
+    }
+}
+
+function removeIncompatibleCharacters(text) {
+    return Array.from(text, character => {
+        const code = character.codePointAt(0);
+        return (code <= 8 || (code >= 11 && code <= 12) || (code >= 14 && code <= 31)) ? " " : character;
+    }).join("");
+}
+
+function escapeXmlText(value) {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeXmlAttribute(value) {
+    return escapeXmlText(value).replace(/'/g, "&apos;").replace(/\"/g, "&quot;");
+}
+
+async function generateSecMsGec(nowMs = Date.now() + clockSkewMs) {
+    const roundedUnixSeconds = BigInt(Math.floor(nowMs / 1000 / 300) * 300);
+    const ticks = (roundedUnixSeconds + WINDOWS_EPOCH_SECONDS) * TICKS_PER_SECOND;
+    const value = `${ticks}${TRUSTED_CLIENT_TOKEN}`;
+    const hash = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+    return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+function edgeTimestamp(date = new Date()) {
+    const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const pad = value => String(value).padStart(2, "0");
+    return `${weekdays[date.getUTCDay()]} ${months[date.getUTCMonth()]} ${pad(date.getUTCDate())} ` +
+        `${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:` +
+        `${pad(date.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`;
+}
+
+function edgeUserAgent() {
+    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        `(KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 ` +
+        `Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`;
+}
+
+function signedValue(value, unit) {
+    return `${value >= 0 ? "+" : ""}${value}${unit}`;
 }
 
 function uuid() {
     return crypto.randomUUID().replace(/-/g, "");
 }
 
-async function sign(urlStr) {
-    const url = urlStr.split("://")[1];
-    const encodedUrl = encodeURIComponent(url);
-    const uuidStr = uuid();
-    const formattedDate = dateFormat();
-    const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
-    const decode = await base64ToBytes("oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==");
-    const signData = await hmacSha256(decode, bytesToSign);
-    const signBase64 = await bytesToBase64(signData);
-    return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
-}
-
-function dateFormat() {
-    const formattedDate = (new Date()).toUTCString().replace(/GMT/, "").trim() + " GMT";
-    return formattedDate.toLowerCase();
-}
-
-// 添加请求超时控制
-async function fetchWithTimeout(url, options, timeout = 30000) {
+async function fetchWithTimeout(url, options, timeoutMs) {
     const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const response = await fetch(url, {
-            ...options,
-            signal: controller.signal
-        });
-        clearTimeout(id);
-        return response;
+        return await fetch(url, { ...options, signal: controller.signal });
     } catch (error) {
-        clearTimeout(id);
-        throw error;
+        if (error?.name === "AbortError") {
+            throw new ApiError("Edge TTS connection timed out", 504, "edge_tts_timeout");
+        }
+        throw new ApiError(`Edge TTS connection failed: ${error?.message || String(error)}`, 502, "edge_tts_upstream_error");
+    } finally {
+        clearTimeout(timer);
     }
+}
+
+async function safeResponseText(response) {
+    try {
+        return (await response.text()).replace(/\s+/g, " ").trim().slice(0, 500);
+    } catch {
+        return "";
+    }
+}
+
+function normalizeError(error) {
+    if (error instanceof ApiError) return error;
+    return new ApiError(error?.message || String(error), 500, "edge_tts_error");
+}
+
+function errorResponse(error) {
+    const normalizedError = normalizeError(error);
+    const headers = {
+        "Content-Type": "application/json",
+        ...makeCORSHeaders()
+    };
+    if (normalizedError.status === 405) headers.Allow = "POST, OPTIONS";
+
+    return new Response(JSON.stringify({
+        error: {
+            message: normalizedError.message,
+            type: normalizedError.status < 500 ? "invalid_request_error" : "api_error",
+            param: null,
+            code: normalizedError.code
+        }
+    }), { status: normalizedError.status, headers });
+}
+
+function handleOptions(request) {
+    return new Response(null, {
+        status: 204,
+        headers: {
+            ...makeCORSHeaders(),
+            "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") ||
+                "Authorization, Content-Type"
+        }
+    });
+}
+
+function makeCORSHeaders() {
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Max-Age": "86400"
+    };
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+        ApiError,
+        edgeTimestamp,
+        escapeXmlText,
+        generateSecMsGec,
+        getSsml,
+        normalizeVoiceName,
+        parseAudioMessage,
+        splitText,
+        validateSpeechRequest
+    };
 }

@@ -5,7 +5,7 @@
 ## 开发环境设置
 
 ### 前置要求
-1. Node.js (建议 v16 或更高版本)
+1. Node.js 18 或更高版本
 2. npm 或 yarn
 3. Git
 
@@ -35,9 +35,6 @@ name = "edge-tts-worker"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-[vars]
-API_KEY = "abc"
-
 [dev]
 ip = "0.0.0.0"
 port = 8787
@@ -62,7 +59,7 @@ wrangler dev
 ```bash
 curl -X POST http://localhost:8787/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer abc" \
+  -H "Authorization: Bearer your-test-key" \
   -d '{
     "model": "tts-1",
     "input": "测试文本",
@@ -73,7 +70,7 @@ curl -X POST http://localhost:8787/v1/audio/speech \
 #### 2. 使用测试脚本
 在本地开发环境中运行测试脚本：
 ```bash
-./test_voices.sh http://localhost:8787 abc
+./test_voices.sh http://localhost:8787 your-test-key
 ```
 
 ### 调试技巧
@@ -99,17 +96,22 @@ console.log('请求参数:', request);
 
 ## 部署流程
 
-### 1. 测试构建
+### 1. 运行单元测试
 ```bash
-wrangler publish --dry-run
+node --test worker.test.js
 ```
 
-### 2. 部署到开发环境
+### 2. 测试构建
 ```bash
-wrangler publish --env development
+wrangler deploy --dry-run
 ```
 
-### 3. 部署到生产环境
+### 3. 配置生产 API Key
+```bash
+wrangler secret put API_KEY
+```
+
+### 4. 部署到生产环境
 ```bash
 wrangler deploy
 ```
@@ -131,9 +133,9 @@ const corsHeaders = {
 - 检查 `wrangler.toml` 中的变量配置
 
 ### 3. 请求超时
-- Worker 有 30 秒的执行时间限制
-- 建议限制输入文本长度
-- 考虑添加超时处理
+- 每个上游 WebSocket 请求有 30 秒超时
+- 长文本会安全分块并按顺序合成
+- 单次 API 输入上限为 100000 个字符
 
 
 ## 贡献指南

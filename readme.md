@@ -105,9 +105,8 @@ curl -X POST https://你的worker地址/v1/audio/speech \
   }' --output output.mp3
 ```
 
-### 高级功能
+### 语速与音调控制
 
-**语音情绪控制**
 ```bash
 curl -X POST https://你的worker地址/v1/audio/speech \
   -H "Content-Type: application/json" \
@@ -116,8 +115,8 @@ curl -X POST https://你的worker地址/v1/audio/speech \
     "model": "tts-1",
     "input": "这是一段开心的话！",
     "voice": "zh-CN-XiaoxiaoNeural",
-    "style": "cheerful",
-    "speed": 1.2
+    "speed": 1.2,
+    "pitch": 1.1
   }' --output happy.mp3
 ```
 
@@ -132,7 +131,9 @@ curl -X POST https://你的worker地址/v1/audio/speech \
 | response_format | string | 否 | 音频输出格式 | mp3 | mp3 |
 | speed | number | 否 | 语速调节 (0.5-2.0) | 1.0 | 1.2 |
 | pitch | number | 否 | 音调调节 (0.5-2.0) | 1.0 | 1.1 |
-| style | string | 否 | 语音情绪风格 | general | cheerful |
+| style | string | 否 | 兼容字段；当前 Edge 协议会忽略此值 | general | general |
+
+> 当前 Edge 在线语音服务只接受单个 `voice` 和 `prosody` 结构，不支持自定义 `mstts:express-as` 情绪样式。
 
 ### 语音角色说明
 
@@ -274,6 +275,5 @@ MIT License
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
-
 
 
