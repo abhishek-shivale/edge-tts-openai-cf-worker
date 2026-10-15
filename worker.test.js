@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { createHash, webcrypto } = require("node:crypto");
+const { webcrypto } = require("node:crypto");
 const test = require("node:test");
 
 globalThis.crypto ??= webcrypto;
@@ -76,16 +76,18 @@ test("parses Edge binary audio frames", () => {
     assert.deepEqual(Buffer.from(parsed.audio), audio);
 });
 
-test("generates current Sec-MS-GEC token", async () => {
-    const now = Date.UTC(2026, 7, 3, 10, 7, 12);
-    const roundedSeconds = Math.floor(now / 1000 / 300) * 300;
-    const ticks = (BigInt(roundedSeconds) + 11644473600n) * 10000000n;
-    const expected = createHash("sha256")
-        .update(`${ticks}6A5AA1D4EAFF4E9FB37E23D68491D6F4`, "ascii")
-        .digest("hex")
-        .toUpperCase();
+test("generates Sec-MS-GEC v2 tokens matching edge-tts 7.3.1", () => {
+    // Reference values from rany2/edge-tts drm.generate_sec_ms_gec_v2(unix_seconds).
+    const vectors = {
+        0: "52BC7A17B50DFEC9-28C4394775C8751CD2F6859C030C06DB1489ACAB3B3A7651831FC26895177ED6",
+        1700000000: "2CD23A2CA0B2595A-F3C846C370E05F9CC83ACC5F995C5F5D87A4D0F14CE8936A0F902E64099E38A2",
+        1785751632: "8F430F39A2975CD8-4ECE859CB0A008369DB09EFEBAAD5F08E35AA8C6A56BB96149A460E4C517CC5A",
+        1792078900: "435FD64D0FCDBA44-17127C17B6E696D592A00D33BE4D24E87FCF3B64CE74CA9B45BFDD86836792FD"
+    };
 
-    assert.equal(await generateSecMsGec(now), expected);
+    for (const [seconds, expected] of Object.entries(vectors)) {
+        assert.equal(generateSecMsGec(Number(seconds) * 1000), expected);
+    }
 });
 
 test("formats Edge timestamps and regional voice names", () => {
